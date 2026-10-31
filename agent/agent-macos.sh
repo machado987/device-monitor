@@ -19,7 +19,7 @@ ID="$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F'"' '/IOPlatformUUID/ { print
 HOST="$(scutil --get ComputerName 2>/dev/null || hostname -s)"
 MODEL="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Model Name/ { print $2; exit }')"
 OS="macOS $(sw_vers -productVersion 2>/dev/null)"
-[ -n "$MODEL" ] && OS="$OS · $MODEL"
+[ -n "$MODEL" ] && OS="$OS Â· $MODEL"
 CPU_NAME="$(sysctl -n machdep.cpu.brand_string 2>/dev/null)"
 THREADS="$(sysctl -n hw.logicalcpu 2>/dev/null)"
 case "$MODEL" in *Book*) FORM=laptop ;; *) FORM=desktop ;; esac
@@ -152,6 +152,75 @@ print(json.dumps(groups[:8], separators=(',', ':')))
 PY
 AI_N=0
 PREV_NET="$(read_net)"; PREV_DISK="$(read_disk)"; PREV_T="$(now)"
+# Python is optional: older systems keep metrics but report inventory unavailable.
+DM_SUPPORT=$(cat <<'DM_PY'
+import json, os, sys, time, hmac, hashlib, subprocess, pathlib, re
+def collect():
+    peripherals, macs = [], []
+    if sys.platform == 'darwin':
+        r = subprocess.run(['/usr/sbin/system_profiler', 'SPUSBDataType', '-json'], capture_output=True, text=True, timeout=10)
+        if r.returncode: raise RuntimeError('USB inventory unavailable')
+        def visit(items):
+            for x in items:
+                if x.get('vendor_id') or x.get('product_id'):
+                    peripherals.append(dict(name=x.get('_name', 'USB device'), kind='USB', vendor=x.get('manufacturer')))
+                visit(x.get('_items', []))
+        visit(json.loads(r.stdout).get('SPUSBDataType', []))
+        r = subprocess.run(['/sbin/ifconfig'], capture_output=True, text=True, timeout=5)
+        macs = re.findall(r'ether\s+([0-9a-f:]{17})', r.stdout)
+    else:
+        for p in sorted(pathlib.Path('/sys/bus/usb/devices').glob('*')):
+            try:
+                name=(p/'product').read_text().strip()
+                vendor=(p/'manufacturer').read_text().strip() if (p/'manufacturer').exists() else None
+                peripherals.append(dict(name=name, kind='USB', vendor=vendor))
+            except OSError: pass
+        for p in sorted(pathlib.Path('/sys/class/input').glob('event*/device/name')):
+            try:
+                name=p.read_text().strip()
+                if name not in [x['name'] for x in peripherals]: peripherals.append(dict(name=name, kind='Input'))
+            except OSError: pass
+        for p in pathlib.Path('/sys/class/net').glob('*/address'):
+            if not (p.parent/'device').exists(): continue
+            macs.append(p.read_text().strip())
+    return dict(peripherals=peripherals[:128], macs=macs[:8], actions=['shutdown'] if os.getenv('DM_ALLOW_SHUTDOWN') == '1' else [])
+def execute(reply):
+    if os.getenv('DM_ALLOW_SHUTDOWN') != '1': return None
+    device=os.environ['DM_DEVICE_ID']
+    for c in reply.get('commands', [])[:8]:
+        cid, action, expiry = c.get('id'), c.get('action'), c.get('expires')
+        if not isinstance(cid,str) or not re.fullmatch('[a-f0-9]{12}',cid) or action != 'shutdown': continue
+        if not isinstance(expiry,int) or not 0 < expiry - time.time()*1000 <= 60000: continue
+        msg=f'device-monitor-cmd-v2:{device}:{cid}:{action}:{expiry}'
+        sig=hmac.new(os.environ['TOKEN'].encode(),msg.encode(),hashlib.sha256).hexdigest()
+        if not isinstance(c.get('sig'),str) or not hmac.compare_digest(sig,c['sig']): continue
+        # Persist before executing; duplicate replies remain harmless across restarts.
+        folder=pathlib.Path.home()/'.device-monitor'
+        folder.mkdir(mode=0o700,exist_ok=True)
+        ledger=folder/'power-seen.json'
+        try: seen=json.loads(ledger.read_text()) if ledger.exists() else {}
+        except (ValueError,OSError): return dict(id=cid,ok=False,message='Cannot read replay ledger')
+        seen={k:v for k,v in seen.items() if isinstance(v,int) and v > time.time()*1000}
+        if cid in seen: continue
+        seen[cid]=expiry
+        try:
+            fd=os.open(str(ledger),os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+            with os.fdopen(fd,'w') as f: json.dump(seen,f); f.flush(); os.fsync(f.fileno())
+            argv=['/sbin/shutdown','-h','+1'] if sys.platform == 'darwin' else ['/usr/bin/systemctl','--no-ask-password','poweroff']
+            r=subprocess.run(argv,capture_output=True,timeout=10)
+            return dict(id=cid,ok=r.returncode==0,message='OS accepted shutdown request' if r.returncode==0 else 'OS denied shutdown; check local permissions')
+        except (OSError,subprocess.TimeoutExpired): return dict(id=cid,ok=False,message='Shutdown could not be started')
+    return None
+try:
+    if sys.argv[1]=='inventory': print(json.dumps(collect(),separators=(',',':'))[1:-1])
+    else: print(json.dumps(execute(json.load(sys.stdin)),separators=(',',':')))
+except Exception:
+    print('"peripherals":null,"macs":[],"actions":[]' if sys.argv[1]=='inventory' else 'null')
+DM_PY
+)
+export TOKEN DM_ALLOW_SHUTDOWN
+export DM_DEVICE_ID="$ID"
+EXTRA='"peripherals":null,"macs":[],"actions":[]'; RESULT=null; INVENTORY_AT=0
 while true; do
   if [ -n "$PY3" ] && [ $((AI_N++ % 5)) -eq 0 ]; then AI="$("$PY3" -I -c "$AI_PY" 2>/dev/null)"; fi
   # Exit with the desktop app that started us (if any).
@@ -169,7 +238,13 @@ while true; do
   [ -n "$SMCTEMP" ] && CPU_TEMP="$(num "$("$SMCTEMP" -c 2>/dev/null | head -1)")"
   UPTIME=$(( $(date +%s) - ${BOOT:-$(date +%s)} ))
 
-  BODY="{\"id\":\"$(esc "$ID")\",\"token\":\"$TOKEN\",\"hostname\":\"$(esc "$HOST")\",\"platform\":\"macos\",\"appVersion\":\"$(esc "${DM_APP_VERSION:-}")\",\"os\":\"$(esc "$OS")\",\"formFactor\":\"$FORM\",\"uptime\":$UPTIME,\"cpu\":{\"name\":\"$(esc "$CPU_NAME")\",\"threads\":$(num "$THREADS"),\"clockMHz\":null,\"temp\":$CPU_TEMP,\"usage\":$CPU,\"cores\":[]},\"memory\":{\"total\":$MEM_TOTAL,\"used\":$(memory_used)},\"gpus\":[$(gpus_json)],\"disks\":[$(disks_json)],$RATES,\"ai\":${AI:-null}}"
-  curl -fsS -m 5 -X POST -H 'Content-Type: application/json' --data-binary "$BODY" "$HUB/api/report" >/dev/null 2>&1
+  if [ -n "$PY3" ] && [ $(( $(date +%s) - INVENTORY_AT )) -ge 30 ]; then
+    EXTRA="$("$PY3" -I -c "$DM_SUPPORT" inventory 2>/dev/null)"
+    [ -n "$EXTRA" ] || EXTRA='"peripherals":null,"macs":[],"actions":[]'
+    INVENTORY_AT=$(date +%s)
+  fi
+  BODY="{$EXTRA,\"actionResult\":$RESULT,\"id\":\"$(esc "$ID")\",\"token\":\"$TOKEN\",\"hostname\":\"$(esc "$HOST")\",\"platform\":\"macos\",\"appVersion\":\"$(esc "${DM_APP_VERSION:-}")\",\"os\":\"$(esc "$OS")\",\"formFactor\":\"$FORM\",\"uptime\":$UPTIME,\"cpu\":{\"name\":\"$(esc "$CPU_NAME")\",\"threads\":$(num "$THREADS"),\"clockMHz\":null,\"temp\":$CPU_TEMP,\"usage\":$CPU,\"cores\":[]},\"memory\":{\"total\":$MEM_TOTAL,\"used\":$(memory_used)},\"gpus\":[$(gpus_json)],\"disks\":[$(disks_json)],$RATES,\"ai\":${AI:-null}}"
+  REPLY="$(curl -fsS -m 5 -X POST -H 'Content-Type: application/json' --data-binary "$BODY" "$HUB/api/report" 2>/dev/null)"
+  if [ -n "$PY3" ] && [ -n "$REPLY" ]; then RESULT="$(printf '%s' "$REPLY" | "$PY3" -I -c "$DM_SUPPORT" reply 2>/dev/null)"; RESULT="${RESULT:-null}"; fi
   sleep $(( INTERVAL > 1 ? INTERVAL - 1 : 1 ))
 done

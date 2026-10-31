@@ -9,6 +9,7 @@
   "scripts": {
     "start": "electron .",
     "hub": "node server.js",
+    "test": "node --test build/test/*.test.js",
     "icon": "node build/make-icon.js",
     "dist": "node build/make-icon.js && electron-builder --win nsis",
     "dist:mac": "node build/make-icon.js && electron-builder --mac dmg zip --universal",
@@ -33,6 +34,7 @@
       "build/trayTemplate@2x.png",
       "security.js",
       "power.js",
+      "power-control.js",
       "alerts.js",
       "safe-json.js",
       "tailscale.js",

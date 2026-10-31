@@ -14,13 +14,13 @@ const { Alerts } = require('./alerts');
 const { readJson, writeJson } = require('./safe-json');
 const tailscale = require('./tailscale');
 const sec = require('./security');
+const { PowerControl } = require('./power-control');
 
 const LIVE_HISTORY_MS = 10 * 60 * 1000; // raw samples sent to dashboards on connect
 const RANGES = { '10m': 10 * 60e3, '1h': 60 * 60e3, '6h': 6 * 3600e3, '24h': 24 * 3600e3, '7d': 7 * 86400e3, '30d': 30 * 86400e3 };
 const OFFLINE_MS = 10000;
 const MAX_DEVICES = 250;      // caps registry/history growth from bogus reports
 const MAX_STREAMS = 64;       // concurrent dashboard connections
-const COMMAND_TTL = 60e3;     // power actions not picked up by the device within a minute are dropped
 const PROCS_WATCH_MS = 20e3;  // devices send their process list while a dashboard keeps asking
 // Static files for the installable phone app (PWA).
 const STATIC = {
@@ -108,7 +108,7 @@ for (const [id, d] of Object.entries(readJson(DEVICES_FILE, {}))) if (sec.isVali
 // id -> { latest } (memory only); metric history lives in the HistoryStore
 const live = Object.create(null);
 const history = new HistoryStore(DATA_DIR);
-const commands = new Map();   // id -> [{ id, action, t }] waiting for the device's next report
+const controls = new PowerControl(path.join(DATA_DIR, 'power-log.json'));
 const procWatch = new Map();  // id -> time until which the device should send its processes
 
 let saveTimer = null;
@@ -135,6 +135,7 @@ function broadcast(msg) {
   for (const res of clients) res.write(data);
 }
 const statusTimer = setInterval(() => {
+  try { controls.expire(); } catch (e) { console.error('Power audit:', e.message); }
   // Heartbeat + lets clients notice devices that went offline.
   broadcast({ type: 'status', online: Object.fromEntries(Object.keys(registry).map(id => [id, deviceView(id).online])) });
 }, 3000);
@@ -274,20 +275,14 @@ function handleReport(raw) {
   history.add(id, sample);
   saveRegistry();
   broadcast({ type: 'report', id, device: { ...reg, online: true, latest: body }, sample });
-  if (body.actionResult) broadcast({ type: 'actionResult', id, name: reg.name, result: body.actionResult });
+  if (body.actionResult && controls.result(id, body.actionResult)) broadcast({ type: 'actionResult', id, name: reg.name, result: body.actionResult });
   alerts.onReport(id, body);
 
   // The reply tells the agent what the dashboards want from it.
   const reply = { ok: true };
   if ((procWatch.get(id) || 0) > now) reply.procs = true;
-  const queued = (commands.get(id) || []).filter(c => now - c.t < COMMAND_TTL && body.actions.includes(c.action));
-  commands.delete(id);
-  // Each queued action is HMAC-signed so an agent can tell a queued command from a LAN MITM
-  // injecting one into the plain-HTTP reply. Agents verify before executing.
-  if (queued.length) reply.commands = queued.map(({ id: cid, action }) => ({
-    id: cid, action,
-    sig: crypto.createHmac('sha256', String(config.token)).update(`device-monitor-cmd:${cid}:${action}`).digest('hex'),
-  }));
+  const queued = controls.deliver(id, body.actions, config.token);
+  if (queued.length) reply.commands = queued;
   return reply;
 }
 
@@ -484,6 +479,7 @@ const server = http.createServer(async (req, res) => {
       pairing = { code: String(crypto.randomInt(0, 1e6)).padStart(6, '0'), expires: Date.now() + PAIR_MS, tries: 0 };
       return send(res, 200, { code: pairing.code, expires: pairing.expires });
     }
+    if (req.method === 'GET' && p === '/api/power/log') { controls.expire(); return send(res, 200, controls.events); }
     if (req.method === 'GET' && p === '/api/devices') {
       return send(res, 200, Object.keys(registry).map(deviceView));
     }
@@ -560,19 +556,30 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, { procs: l.procs && Date.now() - l.procs.t < PROCS_WATCH_MS ? l.procs : null, supported: !!l.latest?.features?.includes('procs'), threads: l.latest?.cpu?.threads ?? null });
     }
     if (pid && pm[2] === 'action' && req.method === 'POST') {
-      const { action } = await readBody(req);
+      const { action, confirmedDevice } = await readBody(req);
+      const peer = req.socket.remoteAddress;
+      const rejectAction = (status, message) => {
+        controls.record({ device: pid, action: action === 'wake' || sec.ACTIONS.has(action) ? action : undefined, peer, status: 'rejected', message });
+        return send(res, status, { error: message });
+      };
+      if (confirmedDevice !== pid) {
+        return rejectAction(400, 'Confirm the target device before sending a power command.');
+      }
       const reg = registry[pid], latest = live[pid]?.latest;
       if (action === 'wake') {
-        if (!reg.macs?.length) return send(res, 400, { error: "This device hasn't reported a network card address yet." });
-        await discovery.wake(reg.macs);
+        if (!reg.macs?.length) return rejectAction(400, "This device hasn't reported a network card address yet.");
+        controls.record({ device: pid, action, peer, status: 'requested' });
+        try { await discovery.wake(reg.macs); }
+        catch (e) { controls.record({ device: pid, action, peer, status: 'failed', message: 'Wake packet could not be sent' }); throw e; }
+        controls.record({ device: pid, action, peer, status: 'sent' });
         broadcast({ type: 'actionResult', id: pid, name: reg.name, result: { ok: true, message: 'Wake-up signal sent.' } });
         return send(res, 200, { ok: true });
       }
-      if (!sec.ACTIONS.has(action)) return send(res, 400, { error: 'unknown action' });
-      if (!deviceView(pid).online) return send(res, 409, { error: `${reg.name} is offline.` });
-      if (!latest?.actions?.includes(action)) return send(res, 409, { error: `Remote power control is turned off on ${reg.name}.` });
-      const cmd = { id: crypto.randomBytes(6).toString('hex'), action, t: Date.now() };
-      commands.set(pid, (commands.get(pid) || []).filter(c => c.action !== action).concat(cmd));
+      if (!sec.ACTIONS.has(action)) return rejectAction(400, 'unknown action');
+      if (!deviceView(pid).online) return rejectAction(409, `${reg.name} is offline.`);
+      if (!latest?.actions?.includes(action)) return rejectAction(409, `Remote power control is turned off on ${reg.name}.`);
+      controls.expire();
+      const cmd = controls.queue(pid, action, peer);
       return send(res, 200, { ok: true, id: cmd.id });
     }
     const m = p.match(/^\/api\/devices\/([^/]+)$/);
@@ -587,7 +594,8 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, deviceView(id));
       }
       if (req.method === 'DELETE') {
-        delete registry[id]; delete live[id]; history.remove(id); alerts.removeDevice(id); commands.delete(id); procWatch.delete(id);
+        controls.cancel(id);
+        delete registry[id]; delete live[id]; history.remove(id); alerts.removeDevice(id); procWatch.delete(id);
         saveRegistry();
         broadcast({ type: 'removed', id });
         return send(res, 200, { ok: true });

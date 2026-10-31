@@ -47,6 +47,20 @@ Expect it to be within about 20% of a plug-in power meter.
 |---|---|
 | ![24 hours of utilization and temperature history for one device](docs/screenshots/history.png) | ![Electricity use and cost per device over 7 days](docs/screenshots/advanced.png) |
 
+## Peripherals, uptime and remote power
+
+Each online card shows operating-system uptime, including just after boot. **Details → Connected peripherals** lists the current inventory, refreshed every 30 seconds. Windows reports present USB, input, display, audio, camera, printer and Bluetooth devices through CIM. Linux reports USB and input devices through sysfs; macOS reports USB devices through System Profiler. These are OS inventories, so internal USB devices can appear too; macOS Bluetooth devices are not currently enumerated. Serial numbers and device paths are not collected. Unavailable inventory is shown separately from an empty inventory. Linux/macOS inventory and remote shutdown require Python 3; metrics continue without it.
+
+**Wake:** open the offline-device list and click **Wake**, then confirm the target. The hub uses the physical network addresses last reported by the agent and sends magic packets on its own local networks. Enable Wake on LAN in the target's firmware and network-card settings first. A successful send does not prove the machine woke up. Broadcasts do not normally cross routers or Tailscale.
+
+**Shut down:** disabled by default. Opt in on each target by setting `DM_ALLOW_SHUTDOWN=1` in the agent's environment before starting it. For a standalone Windows agent, add `"allowShutdown": true` to its existing `config.json`; for a standalone Linux/macOS agent, add `DM_ALLOW_SHUTDOWN=1` to its existing `config` file. Restart that agent. Desktop users can set the environment variable for their account and restart the app. The card's options menu then offers **Shut down…** with a confirmation naming the target and warning about unsaved work. The API also requires `confirmedDevice` to equal the target ID. Windows requests shutdown without forcing applications closed; macOS schedules shutdown in one minute; Linux requests poweroff through systemd without interactive authorization. OS permissions still apply; no elevation, sudo rule or privilege grant is installed. Only shutdown is advertised by these agents.
+
+Power endpoints use the existing authenticated hub session/Bearer key and origin restrictions. Commands expire after 60 seconds, are signed over the target ID, command ID, action and expiry, and are checked against a local persistent replay ledger before execution. Target and hub clocks must agree within that window. Legacy agents do not support this command protocol and must be updated. The shared hub key identifies trusted network clients, not individual people or device-specific roles.
+
+**Power activity** in each device's menu shows its latest events. The authenticated `GET /api/power/log` endpoint returns the hub's last 500 events, persisted in `power-log.json` with timestamps, peer address for requests, device, command ID and status, without the access key. Statuses distinguish queued, delivered, accepted by the OS, failed, expired before delivery, unconfirmed after delivery, cancelled on device removal, and interrupted by hub restart. OS acceptance is not proof that shutdown completed; an immediate shutdown may prevent the agent from reporting back. Pending commands are never restored after a hub restart. If the audit file cannot be saved, new commands are refused.
+
+Run `npm test` (Node 22+ and Python 3). Tests mock OS shutdown and UDP traffic; they never shut down a machine. CI runs Windows, macOS and Linux checks. Hardware-specific inventory and power behavior still need validation on the intended machines.
+
 ## Pushing updates to all your devices
 
 On the PC that hosts the hub, from this folder:

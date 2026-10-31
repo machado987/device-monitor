@@ -35,6 +35,9 @@ function normalizeReport(b) {
     platform: PLATFORMS.has(b.platform) ? b.platform : 'unknown',
     os: str(b.os, 120),
     uptime: num(b.uptime, 0, 1e10),
+    peripherals: Array.isArray(b.peripherals) ? list(b.peripherals, 128).filter(isObj).map(p => ({
+      name: str(p.name, 120), kind: str(p.kind, 40), vendor: str(p.vendor, 80),
+    })).filter(p => p.name) : null,
     formFactor: b.formFactor === 'laptop' || b.formFactor === 'desktop' ? b.formFactor : null,
     power: isObj(b.power) ? { cpu: num(b.power.cpu, 0, 5000) } : null,
     features: list(b.features, 8).filter(f => f === 'procs' || f === 'actions'),

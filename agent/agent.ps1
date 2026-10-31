@@ -12,12 +12,44 @@ $ProgressPreference = 'SilentlyContinue'
 
 $cfgPath = Join-Path $PSScriptRoot 'config.json'
 if (-not $Token -and $env:DM_TOKEN) { $Token = $env:DM_TOKEN }   # set by the desktop app
-if ((-not $Hub -or -not $Token) -and (Test-Path $cfgPath)) {
+if (Test-Path $cfgPath) {
   $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
   if (-not $Hub) { $Hub = $cfg.hub }
   if (-not $Token) { $Token = $cfg.token }
 }
 if (-not $Hub -or -not $Token) { Write-Error 'Hub and Token are required'; exit 1 }
+# Opt in locally via config.json allowShutdown=true or DM_ALLOW_SHUTDOWN=1.
+$allowShutdown = $env:DM_ALLOW_SHUTDOWN -eq '1' -or $cfg.allowShutdown -eq $true
+$actionResult = $null; $inventoryAt = [datetime]::MinValue; $peripherals = $null; $macs = @()
+function Invoke-PowerReply($reply, $deviceId) {
+  if (-not $allowShutdown) { return $null }
+  foreach ($c in @($reply.commands)) {
+    if ($c.id -notmatch '^[a-f0-9]{12}$' -or $c.action -ne 'shutdown') { continue }
+    $expires = 0L
+    if (-not [long]::TryParse([string]$c.expires, [ref]$expires)) { continue }
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    if ($expires -le $nowMs -or $expires -gt $nowMs + 60000) { continue }
+    $hmac = New-Object Security.Cryptography.HMACSHA256
+    $hmac.Key = [Text.Encoding]::UTF8.GetBytes($Token)
+    $msg = "device-monitor-cmd-v2:${deviceId}:$($c.id):shutdown:${expires}"
+    $sig = -join ($hmac.ComputeHash([Text.Encoding]::UTF8.GetBytes($msg)) | ForEach-Object { $_.ToString('x2') })
+    $hmac.Dispose()
+    if ($c.sig -cne $sig) { continue }
+    try {
+      $ledgerDir = Join-Path $env:LOCALAPPDATA 'DeviceMonitorAgent'
+      New-Item -ItemType Directory -Force -Path $ledgerDir -ErrorAction Stop | Out-Null
+      $ledger = Join-Path $ledgerDir 'power-seen.json'
+      $seen = @()
+      if (Test-Path $ledger) { $seen = @(Get-Content $ledger -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop | Where-Object { $_.expires -gt $nowMs }) }
+      if (@($seen | Where-Object { $_.id -eq $c.id }).Count) { continue }
+      @($seen + @(@{ id = $c.id; expires = $expires })) | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $ledger -ErrorAction Stop
+      # No /f: do not force applications with unsaved work to close.
+      & "$env:SystemRoot\System32\shutdown.exe" /s /t 0
+      return @{ id = $c.id; ok = ($LASTEXITCODE -eq 0); message = if ($LASTEXITCODE -eq 0) { 'OS accepted shutdown request' } else { 'OS denied shutdown request' } }
+    } catch { return @{ id = $c.id; ok = $false; message = 'Shutdown or replay ledger failed' } }
+  }
+  return $null
+}
 $Hub = $Hub.TrimEnd('/')
 
 $deviceId = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Cryptography').MachineGuid
@@ -209,6 +241,16 @@ while ($true) {
   }
   $prevNet = $net; $prevDisk = $disk; $prevTime = $now
 
+  if (([datetime]::UtcNow - $inventoryAt).TotalSeconds -ge 30) {
+    try {
+      $peripherals = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.Status -eq 'OK' -and ($_.PNPClass -in @('Keyboard','Mouse','HIDClass','Monitor','Printer','Bluetooth','Camera','Image','AudioEndpoint') -or $_.PNPDeviceID -like 'USB\*') } | Select-Object -First 128 | ForEach-Object { @{ name = $_.Name; kind = $_.PNPClass; vendor = $_.Manufacturer } })
+    } catch { $peripherals = $null }
+    $macs = @(Get-CimInstance Win32_NetworkAdapter -Filter 'PhysicalAdapter=True' | Where-Object { $_.MACAddress } | Select-Object -First 8 | ForEach-Object { $_.MACAddress.ToLower().Replace('-', ':') })
+    $inventoryAt = [datetime]::UtcNow
+  }
+  $payload.peripherals = $peripherals; $payload.macs = $macs
+  $payload.actions = @(); if ($allowShutdown) { $payload.actions = @('shutdown') }
+  $payload.actionResult = $actionResult
   $payload.cpu = $cpu; $payload.memory = $memory; $payload.gpus = $gpus; $payload.disks = $disks
   $payload.net = $netRate; $payload.diskIO = $diskRate; $payload.temps = $temps; $payload.fans = $fans
   if ($aiTick++ % 5 -eq 0) { $ai = Get-AiModels }
@@ -217,7 +259,8 @@ while ($true) {
   if ($null -ne $usage) {
     try {
       $json = $payload | ConvertTo-Json -Depth 6 -Compress
-      Invoke-RestMethod -Uri "$Hub/api/report" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json' -TimeoutSec 5 | Out-Null
+      $reply = Invoke-RestMethod -Uri "$Hub/api/report" -Method Post -Body ([Text.Encoding]::UTF8.GetBytes($json)) -ContentType 'application/json' -TimeoutSec 5
+      $actionResult = Invoke-PowerReply $reply $payload.id
     } catch { }
   }
   $elapsed = ([DateTime]::UtcNow - $now).TotalMilliseconds

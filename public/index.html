@@ -518,7 +518,7 @@ function updateCard(id) {
   el.classList.toggle('offline', !d.online);
   refs.name.textContent = d.name || d.hostname || id;
   refs.name.title = d.hostname || '';
-  const status = d.online ? (L.uptime ? 'up ' + fmtUptime(L.uptime) : 'online') : 'offline · last seen ' + (d.lastSeen ? ago(d.lastSeen) : 'never');
+  const status = d.online ? (L.uptime != null ? 'up ' + fmtUptime(L.uptime) : 'online') : 'offline · last seen ' + (d.lastSeen ? ago(d.lastSeen) : 'never');
   refs.sub.textContent = [d.os || d.platform, status, versionLabel(d)].filter(Boolean).join(' · ');
 
   const cpu = L.cpu || {}, mem = L.memory || {}, gpus = L.gpus || [], g = gpus[0] || {};
@@ -596,6 +596,7 @@ function detailHtml(L) {
   if (!L.offline && !L.temps?.length && L.platform === 'windows' && L.cpu?.temp == null) {
     h += `<div class="section hint">CPU temperature, fans and motherboard sensors appear here if <b>LibreHardwareMonitor</b> is running on this PC.</div>`;
   }
+  h += `<div class="section"><h4>Connected peripherals</h4>${L.peripherals == null ? '<span class="hint">Inventory unavailable from this agent.</span>' : L.peripherals.length ? '<div class="kv">' + L.peripherals.map(p => `<span>${esc(p.name)}</span><span>${esc([p.kind, p.vendor].filter(Boolean).join(' · '))}</span>`).join('') + '</div>' : '<span class="hint">No peripherals detected.</span>'}</div>`;
   return h || '<div class="section hint">No data yet.</div>';
 }
 
@@ -796,8 +797,9 @@ $('#offPop').addEventListener('click', async e => {
   const id = row.dataset.id, btn = e.target.closest('[data-a]');
   if (btn?.dataset.a === 'menu') return openMenu(e, id, btn);
   if (btn?.dataset.a === 'wake') {
+    if (!confirm(`Send a Wake-on-LAN signal to ${devices.get(id)?.name || id}?`)) return;
     btn.disabled = true; btn.textContent = 'Sending…';
-    const r = await fetch('/api/devices/' + encodeURIComponent(id) + '/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'wake' }) }).catch(() => null);
+    const r = await fetch('/api/devices/' + encodeURIComponent(id) + '/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'wake', confirmedDevice: id }) }).catch(() => null);
     btn.textContent = r?.ok ? 'Sent ✓' : 'Failed';
     return;
   }
@@ -853,7 +855,7 @@ function openMenu(e, id, anchor = e.currentTarget) {
   document.querySelector('.menu')?.remove();
   const m = document.createElement('div');
   m.className = 'menu';
-  m.innerHTML = `<button data-a="history">History</button><button data-a="rename">Rename</button><button data-a="remove" class="danger">Remove from dashboard</button>`;
+  m.innerHTML = `<button data-a="history">History</button><button data-a="rename">Rename</button>${devices.get(id)?.online && devices.get(id)?.latest?.actions?.includes('shutdown') ? '<button data-a="shutdown" class="danger">Shut down…</button>' : ''}<button data-a="power-log">Power activity</button><button data-a="remove" class="danger">Remove from dashboard</button>`;
   document.body.appendChild(m);
   const r = anchor.getBoundingClientRect();
   m.style.top = (r.bottom + window.scrollY + 4) + 'px';
@@ -862,7 +864,17 @@ function openMenu(e, id, anchor = e.currentTarget) {
     const a = ev.target.dataset.a; m.remove();
     const d = devices.get(id);
     if (a === 'history') location.hash = '#/history/' + encodeURIComponent(id);
-    else if (a === 'rename') {
+    else if (a === 'power-log') {
+      const r = await fetch('/api/power/log');
+      if (!r.ok) return alert('Unable to load power activity.');
+      const events = (await r.json()).filter(e => e.device === id).slice(-20).reverse();
+      alert(events.map(e => `${new Date(e.at).toLocaleString()} · ${e.action || 'command'} · ${e.status}${e.message ? ' · ' + e.message : ''}`).join('\n') || 'No power activity.');
+    } else if (a === 'shutdown') {
+      if (!confirm(`Shut down "${d.name}"? Unsaved work may be lost. The operating system must allow this action.`)) return;
+      const r = await fetch('/api/devices/' + encodeURIComponent(id) + '/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'shutdown', confirmedDevice: id }) }).catch(() => null);
+      const result = r ? await r.json() : null;
+      alert(r?.ok ? 'Shutdown queued. Check Power activity for the agent response.' : result?.error || 'Unable to send shutdown.');
+    } else if (a === 'rename') {
       const name = prompt('Device name', d.name);
       if (name) await fetch('/api/devices/' + encodeURIComponent(id), { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) });
     } else if (a === 'remove') {

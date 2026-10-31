@@ -60,16 +60,29 @@ function discover(timeout = 1500) {
 // Wake-on-LAN: a "magic packet" (6 x 0xFF, then the MAC address 16 times) broadcast on every
 // local network, on the usual ports. The device's network card and BIOS must have it turned on.
 function wake(macs) {
+  if (!Array.isArray(macs) || !macs.length || macs.some(m => !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/i.test(m)))
+    return Promise.reject(new Error('Invalid Wake-on-LAN addresses'));
   const packets = macs.map(m => Buffer.concat([Buffer.alloc(6, 0xff), ...Array(16).fill(Buffer.from(m.split(':').map(h => parseInt(h, 16))))]));
-  return new Promise(resolve => {
+  return new Promise((resolve, reject) => {
     const sock = dgram.createSocket('udp4');
-    sock.on('error', () => {});
+    let finished = false, succeeded = false;
+    const finish = error => {
+      if (finished) return;
+      finished = true; clearTimeout(timer);
+      try { sock.close(); } catch {}
+      if (error) reject(error); else resolve(true);
+    };
+    const timer = setTimeout(() => finish(new Error('Wake-on-LAN timed out')), 5000);
+    sock.on('error', finish);
     sock.bind(() => {
-      sock.setBroadcast(true);
-      let pending = 0;
-      for (const addr of broadcastAddresses()) for (const port of [9, 7]) for (const p of packets) {
-        pending++;
-        sock.send(p, port, addr, () => { if (--pending === 0) { try { sock.close(); } catch {} resolve(true); } });
+      try { sock.setBroadcast(true); } catch (e) { return finish(e); }
+      const addresses = broadcastAddresses();
+      let pending = addresses.length * 2 * packets.length;
+      for (const addr of addresses) for (const port of [9, 7]) for (const p of packets) {
+        sock.send(p, port, addr, error => {
+          if (!error) succeeded = true;
+          if (--pending === 0) finish(succeeded ? null : new Error('Wake-on-LAN send failed'));
+        });
       }
     });
   });
